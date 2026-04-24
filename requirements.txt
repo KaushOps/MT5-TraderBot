@@ -1,0 +1,7 @@
+# Exness MT5 AI Trading Agent — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+MetaTrader5>=5.0.45          # MT5 Python bindings (Windows only)
+openai>=1.0.0                # OpenAI SDK (works with Groq, OpenRouter, Llama, etc)
+python-dotenv>=1.0.0         # .env file loading
+aiohttp>=3.9.0               # Async HTTP server for /diary and /logs endpoints
