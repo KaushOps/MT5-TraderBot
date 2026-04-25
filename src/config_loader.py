@@ -89,6 +89,10 @@ CONFIG = {
     "default_sl_atr_mult":          _get_env("DEFAULT_SL_ATR_MULT", "1.2"),
     "default_tp_atr_mult":          _get_env("DEFAULT_TP_ATR_MULT", "2.0"),
 
+    # Risk-based position sizing & ADX regime filter
+    "risk_per_trade_pct":           _get_env("RISK_PER_TRADE_PCT", "1.0"),
+    "adx_min_for_entry":            _get_env("ADX_MIN_FOR_ENTRY", "20"),
+
     # ── Active position management (Phase 2 / 3) ─────────────────────────────
     "enable_position_manager":      _get_bool("ENABLE_POSITION_MANAGER", True),
     # Breakeven move: once unrealised P&L in R-multiples ≥ this value,

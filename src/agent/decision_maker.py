@@ -24,10 +24,7 @@ class TradingAgent:
         all_models = [
             base_model, 
             "llama-3.3-70b-versatile", 
-            "llama-3.1-8b-instant", 
             "llama3-70b-8192",
-            "llama3-8b-8192",
-            "gemma2-9b-it"
         ]
         self.fallback_models = []
         for m in all_models:
@@ -107,12 +104,12 @@ class TradingAgent:
             "  SELL: tp_price < current_price, sl_price > current_price\n"
             "  If sensible TP/SL cannot be set, use null. A mandatory SL will be auto-applied.\n"
             "- **ATR-anchored targets (CRITICAL)**: The system is running on a SHORT "
-            "intraday loop (5m). The market will NOT reach 3–5% targets before momentum "
-            "reverses. You MUST size TP and SL as multiples of the INTRADAY ATR14 "
-            "(provided in market_data.intraday.atr14, same unit as price).\n"
-            "  • SL distance: 0.8× to 1.5× intraday ATR14 from entry.\n"
-            "  • TP distance: 0.8× to 2.0× intraday ATR14 from entry.\n"
-            "  • Reward:Risk must be between 1.2 and 2.5 (system enforces this).\n"
+            "intraday loop but applies 1-hour trend protection. The market will NOT "
+            "reach 3–5% directional targets before momentum reverses. You MUST size "
+            "TP and SL as multiples of the 1h ATR (or intraday ATR if 1h is unavailable).\n"
+            f"  • SL distance: {CONFIG.get('sl_atr_mult_min', 1.2)}× to {CONFIG.get('sl_atr_mult_max', 2.0)}× ATR from entry.\n"
+            f"  • TP distance: {CONFIG.get('tp_atr_mult_min', 1.5)}× to {CONFIG.get('tp_atr_mult_max', 3.0)}× ATR from entry.\n"
+            f"  • Reward:Risk must be between {CONFIG.get('min_rr', 1.5)} and {CONFIG.get('max_rr', 3.5)} (system enforces this).\n"
             "  Example: BTCUSD price=75600, intraday_atr14=120. For a BUY:\n"
             "    sl_price ≈ 75600 − 1.0×120 = 75480 ; tp_price ≈ 75600 + 1.5×120 = 75780.\n"
             "  The system will clamp your values into these bands — picking round "
