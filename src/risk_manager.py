@@ -6,6 +6,7 @@ applied before every trade execution.
 """
 
 import logging
+import math
 from datetime import datetime, timezone
 
 from src.config_loader import CONFIG
@@ -14,7 +15,8 @@ from src.config_loader import CONFIG
 class RiskManager:
     """Enforces risk limits on every trade before execution."""
 
-    def __init__(self):
+    def __init__(self, mt5_api=None):
+        self.mt5_api = mt5_api
         self.max_position_pct = float(CONFIG.get("max_position_pct") or 10)
         self.max_loss_per_position_pct = float(CONFIG.get("max_loss_per_position_pct") or 20)
         self.max_leverage = float(CONFIG.get("max_leverage") or 10)
@@ -33,6 +35,9 @@ class RiskManager:
         self.max_rr = float(CONFIG.get("max_rr") or 2.5)
         self.default_sl_atr_mult = float(CONFIG.get("default_sl_atr_mult") or 1.0)
         self.default_tp_atr_mult = float(CONFIG.get("default_tp_atr_mult") or 1.5)
+
+        self.risk_per_trade_pct = float(CONFIG.get("risk_per_trade_pct") or 1.0)
+        self.adx_min_for_entry = float(CONFIG.get("adx_min_for_entry") or 20.0)
 
         # Daily tracking
         self.daily_high_value = None
@@ -132,6 +137,20 @@ class RiskManager:
             )
         return True, ""
 
+    def check_trend_strength(self, indicators: dict) -> tuple[bool, str]:
+        """Ensure market is trending before allowing entry (ADX Regime Filter)."""
+        adx_val = indicators.get('adx', 0)
+        # default to 0 if None
+        if adx_val is None:
+            adx_val = 0
+            
+        if adx_val < self.adx_min_for_entry:
+            return False, (
+                f"ADX {adx_val:.1f} below minimum {self.adx_min_for_entry} — "
+                f"market is ranging, skipping trend entry"
+            )
+        return True, ""
+
     # ------------------------------------------------------------------
     # Stop-loss enforcement
     # ------------------------------------------------------------------
@@ -158,21 +177,25 @@ class RiskManager:
         is_buy: bool,
         tp_price: float | None,
         sl_price: float | None,
-        atr: float | None,
-    ) -> tuple[float | None, float, dict]:
+        atr_5m: float | None,
+        atr_1h: float | None = None,
+        symbol: str | None = None,
+    ) -> tuple[float | None, float, dict, float]:
         """Clamp TP/SL distances to sensible ATR multiples and enforce R:R.
 
-        Returns (tp_price, sl_price, adjustments_log). If ATR is unavailable
-        or non-positive, falls back to the legacy percent-based mandatory SL.
+        Returns (tp_price, sl_price, adjustments_log, sl_distance). 
+        If ATR is unavailable or non-positive, falls back to the legacy percent-based mandatory SL.
         The adjustments_log dict carries human-readable reasons for logging.
         """
         log: dict = {}
+        atr = atr_1h if (atr_1h is not None and atr_1h > 0) else atr_5m
 
         if atr is None or atr <= 0 or entry_price <= 0:
             # Fallback: no ATR → use legacy mandatory_sl_pct based SL
             final_sl = self.enforce_stop_loss(sl_price, entry_price, is_buy)
+            sl_dist = abs(entry_price - final_sl)
             log["atr_fallback"] = "no_atr_available_using_pct_sl"
-            return tp_price, final_sl, log
+            return tp_price, final_sl, log, sl_dist
 
         sl_min_dist = atr * self.sl_atr_mult_min
         sl_max_dist = atr * self.sl_atr_mult_max
@@ -213,16 +236,25 @@ class RiskManager:
                 )
                 tp_dist = tp_max_dist
 
+        # --- Spread-Adjusted R:R ---
+        cost = 0.0
+        if symbol and self.mt5_api:
+            capped_spread, live, typ = self.mt5_api.get_effective_spread(symbol)
+            if live > typ * 5.0 and typ > 0:
+                log["blocked"] = f"Spread spike: {live:.5f} > 5x typical ({typ:.5f})"
+            cost = capped_spread
+
         # --- Enforce R:R bounds by adjusting TP (never widen SL beyond max) ---
         if sl_dist > 0:
-            rr = tp_dist / sl_dist
+            effective_sl = sl_dist + cost
+            rr = tp_dist / effective_sl if effective_sl > 0 else 0
             if rr < self.min_rr:
-                new_tp_dist = sl_dist * self.min_rr
+                new_tp_dist = effective_sl * self.min_rr
                 new_tp_dist = min(new_tp_dist, tp_max_dist)
                 log["rr_bumped"] = f"rr={rr:.2f} -> min={self.min_rr} (tp {tp_dist:.6f} -> {new_tp_dist:.6f})"
                 tp_dist = new_tp_dist
             elif rr > self.max_rr:
-                new_tp_dist = sl_dist * self.max_rr
+                new_tp_dist = effective_sl * self.max_rr
                 new_tp_dist = max(new_tp_dist, tp_min_dist)
                 log["rr_capped"] = f"rr={rr:.2f} -> max={self.max_rr} (tp {tp_dist:.6f} -> {new_tp_dist:.6f})"
                 tp_dist = new_tp_dist
@@ -235,7 +267,48 @@ class RiskManager:
             final_sl = round(entry_price + sl_dist, 5)
             final_tp = round(entry_price - tp_dist, 5)
 
-        return final_tp, final_sl, log
+        return final_tp, final_sl, log, sl_dist
+
+    # ------------------------------------------------------------------
+    # Risk-based Position Sizing
+    # ------------------------------------------------------------------
+
+    def adjust_lots_for_risk(self, symbol: str, alloc_usd: float, sl_distance: float, account_value: float, price: float) -> float:
+        """Calculate max USD allocation so SL hit matches account risk %. Converts correctly for INR accounts."""
+        if not self.mt5_api or sl_distance <= 0 or price <= 0:
+            return alloc_usd
+
+        info = self.mt5_api._symbol_info(symbol)
+        if not info:
+            return alloc_usd
+        
+        # 1. Total absolute account risk
+        target_risk_pct = self.risk_per_trade_pct
+        max_account_currency_risk = account_value * (target_risk_pct / 100.0)
+
+        # 2. Convert 1 lot SL loss into account currency
+        # Loss in quote currency (e.g. USD for BTCUSD) for 1 full lot
+        loss_in_quote_per_lot = sl_distance * info.trade_contract_size
+
+        quote_curr = info.currency_profit
+        acc_curr = self.mt5_api.get_account_currency()
+        conv_rate = self.mt5_api.get_conversion_rate(quote_curr, acc_curr)
+
+        loss_acc_per_lot = loss_in_quote_per_lot * conv_rate
+        if loss_acc_per_lot <= 0:
+            return alloc_usd
+
+        # 3. Maximum lots permitted
+        max_lots_by_risk = max_account_currency_risk / loss_acc_per_lot
+
+        # 4. Map max_lots back to USD allocation equivalent for return
+        max_alloc_usd = max_lots_by_risk * info.trade_contract_size * price
+
+        adjusted_alloc = min(alloc_usd, max_alloc_usd)
+        if adjusted_alloc < alloc_usd:
+            logging.warning("RISK: Squashed allocation %.2f -> %.2f to maintain %s%% risk limit", 
+                            alloc_usd, adjusted_alloc, target_risk_pct)
+        return adjusted_alloc
 
     # ------------------------------------------------------------------
     # Force-close losing positions
@@ -395,18 +468,33 @@ class RiskManager:
         # 8. ATR-anchored TP/SL — clamp distances to sensible ATR multiples and R:R.
         #    `atr_at_entry` is injected by main.py (5m ATR14 at entry time).
         atr_at_entry = trade.get("atr_at_entry")
+        atr_1h = trade.get("atr_1h")
         try:
             atr_val = float(atr_at_entry) if atr_at_entry is not None else None
+            atr_1h_val = float(atr_1h) if atr_1h is not None else None
         except (TypeError, ValueError):
             atr_val = None
+            atr_1h_val = None
 
         sl_float = float(sl_price) if sl_price else None
         tp_float = float(tp_price) if tp_price else None
-        final_tp, final_sl, atr_log = self.enforce_atr_bounds(
-            entry_price, is_buy, tp_float, sl_float, atr_val
+        
+        asset = trade.get("asset")
+
+        final_tp, final_sl, atr_log, sl_dist = self.enforce_atr_bounds(
+            entry_price, is_buy, tp_float, sl_float, atr_val, atr_1h_val, asset
         )
+        
+        if atr_log and "blocked" in atr_log:
+            return False, atr_log["blocked"], trade
+
         if atr_log:
             logging.info("RISK: ATR-bounds adjustments %s: %s", trade.get("asset"), atr_log)
+
+        # 8b. Risk-Based Position Sizing
+        # Reduce initial allocation_usd if the wider SL violates % account risk constraint.
+        adjusted_alloc_usd = self.adjust_lots_for_risk(asset, alloc_usd, sl_dist, account_value, entry_price)
+        trade = {**trade, "allocation_usd": adjusted_alloc_usd}
 
         # 9. Minimum stop distance — MT5 rejects stops too close to market price
         #    Use at least 0.1% distance to avoid retcode 10016
@@ -442,6 +530,7 @@ class RiskManager:
         new_tp: float | None,
         new_sl: float | None,
         atr: float | None,
+        atr_1h: float | None = None,
     ) -> tuple[bool, str, float | None, float | None]:
         """Validate an LLM 'adjust' action against ATR bounds and direction.
 
@@ -465,9 +554,12 @@ class RiskManager:
         # Run through ATR-bounds helper — this also enforces direction (BUY TP>entry etc.)
         # but we need the reference price to be the ORIGINAL entry (not current price)
         # so distances are measured from entry consistently.
-        final_tp, final_sl, log = self.enforce_atr_bounds(
-            entry, is_buy, tp_for_check, sl_for_check, atr
+        final_tp, final_sl, log, _sl_dist = self.enforce_atr_bounds(
+            entry, is_buy, tp_for_check, sl_for_check, atr, atr_1h, symbol
         )
+        if log and "blocked" in log:
+             return False, log["blocked"], None, None
+             
         if log:
             logging.info("RISK(adjust) %s bounds adjustments: %s", symbol, log)
 

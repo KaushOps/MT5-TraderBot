@@ -59,6 +59,8 @@ CONFIG = {
     "llm_api_key":          _get_env("LLM_API_KEY", required=True),
     "llm_model":            _get_env("LLM_MODEL", "llama-3.3-70b-versatile"),
     "llm_base_url":         _get_env("LLM_BASE_URL", "https://api.groq.com/openai/v1"),
+    "fallback_llm_api_key":   _get_env("FALLBACK_LLM_API_KEY"),
+    "fallback_llm_base_url":  _get_env("FALLBACK_LLM_BASE_URL", "https://openrouter.ai/api/v1"),
     "enable_tool_calling":    _get_bool("ENABLE_TOOL_CALLING", True),
 
     # ── Runtime controls ─────────────────────────────────────────────────────
@@ -77,34 +79,34 @@ CONFIG = {
 
     # ── ATR-anchored TP/SL (Phase 1) ─────────────────────────────────────────
     # All bounds are expressed as multiples of the 5m ATR14 at entry time.
-    "tp_atr_mult_min":              _get_env("TP_ATR_MULT_MIN", "0.8"),
-    "tp_atr_mult_max":              _get_env("TP_ATR_MULT_MAX", "2.0"),
-    "sl_atr_mult_min":              _get_env("SL_ATR_MULT_MIN", "0.8"),
-    "sl_atr_mult_max":              _get_env("SL_ATR_MULT_MAX", "1.5"),
-    "min_rr":                       _get_env("MIN_RR", "1.2"),
-    "max_rr":                       _get_env("MAX_RR", "2.5"),
+    "tp_atr_mult_min":              _get_env("TP_ATR_MULT_MIN", "1.5"),
+    "tp_atr_mult_max":              _get_env("TP_ATR_MULT_MAX", "3.0"),
+    "sl_atr_mult_min":              _get_env("SL_ATR_MULT_MIN", "1.2"),
+    "sl_atr_mult_max":              _get_env("SL_ATR_MULT_MAX", "2.0"),
+    "min_rr":                       _get_env("MIN_RR", "1.5"),
+    "max_rr":                       _get_env("MAX_RR", "3.5"),
     # Fallback mandatory SL (used only if ATR is unavailable for the symbol)
-    "default_sl_atr_mult":          _get_env("DEFAULT_SL_ATR_MULT", "1.0"),
-    "default_tp_atr_mult":          _get_env("DEFAULT_TP_ATR_MULT", "1.5"),
+    "default_sl_atr_mult":          _get_env("DEFAULT_SL_ATR_MULT", "1.2"),
+    "default_tp_atr_mult":          _get_env("DEFAULT_TP_ATR_MULT", "2.0"),
 
     # ── Active position management (Phase 2 / 3) ─────────────────────────────
     "enable_position_manager":      _get_bool("ENABLE_POSITION_MANAGER", True),
     # Breakeven move: once unrealised P&L in R-multiples ≥ this value,
     # move SL to entry + (buffer_atr × entry ATR). Set <=0 to disable.
-    "breakeven_activate_r":         _get_env("BREAKEVEN_ACTIVATE_R", "0.8"),
-    "breakeven_buffer_atr":         _get_env("BREAKEVEN_BUFFER_ATR", "0.05"),
+    "breakeven_activate_r":         _get_env("BREAKEVEN_ACTIVATE_R", "1.5"),
+    "breakeven_buffer_atr":         _get_env("BREAKEVEN_BUFFER_ATR", "0.15"),
     # Trailing stop: once unrealised R ≥ trail_activate_r, trail SL at
     # (trail_atr_mult × current ATR) behind current price. Set <=0 to disable.
-    "trail_activate_r":             _get_env("TRAIL_ACTIVATE_R", "1.5"),
-    "trail_atr_mult":               _get_env("TRAIL_ATR_MULT", "1.0"),
+    "trail_activate_r":             _get_env("TRAIL_ACTIVATE_R", "2.0"),
+    "trail_atr_mult":               _get_env("TRAIL_ATR_MULT", "1.5"),
     # TP tightening: once unrealised R ≥ tighten_tp_r, pull TP in to
     # current price + (tighten_tp_atr_mult × ATR). Set <=0 to disable.
-    "tighten_tp_r":                 _get_env("TIGHTEN_TP_R", "1.0"),
-    "tighten_tp_atr_mult":          _get_env("TIGHTEN_TP_ATR_MULT", "1.0"),
+    "tighten_tp_r":                 _get_env("TIGHTEN_TP_R", "1.5"),
+    "tighten_tp_atr_mult":          _get_env("TIGHTEN_TP_ATR_MULT", "1.5"),
     # Partial profit taking: once unrealised R ≥ partial_tp_r, close
     # partial_tp_fraction of the position. Set partial_tp_fraction<=0 to disable.
-    "partial_tp_r":                 _get_env("PARTIAL_TP_R", "1.0"),
-    "partial_tp_fraction":          _get_env("PARTIAL_TP_FRACTION", "0.5"),
+    "partial_tp_r":                 _get_env("PARTIAL_TP_R", "1.5"),
+    "partial_tp_fraction":          _get_env("PARTIAL_TP_FRACTION", "0.33"),
 
     # ── Market hours filter ──────────────────────────────────────────────────
     # Skip evaluation / block new entries when the market is closed or about

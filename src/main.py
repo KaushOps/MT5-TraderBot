@@ -109,7 +109,7 @@ def main():
             sys.exit(1)
 
     agent    = TradingAgent(mt5_api=mt5_api)
-    risk_mgr = RiskManager()
+    risk_mgr = RiskManager(mt5_api=mt5_api)
     diary_path = "diary.jsonl"
     pos_mgr  = PositionManager(mt5_api=mt5_api, diary_path=diary_path)
     market_hours = MarketHours(mt5_api=mt5_api)
@@ -322,6 +322,7 @@ def main():
                     any(tr.get("asset") == asset for tr in active_trades)
                     or asset in live_symbols_for_poll
                 )
+                
                 # Market hours check — skip closed symbols entirely unless we
                 # have an open position (we still need to manage it).
                 tradable, mh_reason = market_hours.is_tradable(asset)
@@ -335,15 +336,22 @@ def main():
                     })
                     continue
 
-                if has_active or invocation_count % 3 == 1:
+                # ── ALWAYS evaluate if we have an open position ──
+                if has_active:
                     assets_to_evaluate.append(asset)
-                else:
+                    continue
+
+                # ── Smart polling for assets WITHOUT positions ──
+                if invocation_count % 3 != 1:
                     auto_hold_decisions.append({
                         "asset": asset,
                         "action": "hold",
                         "rationale": "Smart Polling: Skipped cold asset cycle.",
                         "allocation_usd": 0.0,
                     })
+                    continue
+                
+                assets_to_evaluate.append(asset)
 
             if not assets_to_evaluate:
                 add_event("Smart Polling: All assets cold, skipping LLM evaluation this cycle.")
@@ -356,6 +364,8 @@ def main():
             market_sections = []
             asset_prices    = {}
             asset_intraday_atr = {}   # 5m ATR14 per asset, used by RiskManager
+            asset_intraday_data = {}  # Store for ADX check later
+            asset_1h_atr = {}
 
             for asset in args.assets:
                 # Update prices to memory regardless
@@ -381,9 +391,13 @@ def main():
 
                     candles_5m = await _t(mt5_api.get_candles, asset, "5m", 100)
                     candles_4h = await _t(mt5_api.get_candles, asset, "4h", 100)
+                    candles_1h = await _t(mt5_api.get_candles, asset, "1h", 100)
 
                     intra = compute_all(candles_5m)
                     lt    = compute_all(candles_4h)
+                    tf_1h = compute_all(candles_1h)
+                    
+                    asset_intraday_data[asset] = intra
 
                     recent_mids = [e["mid"] for e in list(price_history.get(asset, []))[-3:]]
                     swap_annualized = round(swap_rate * 365 * 100, 4) if swap_rate else None
@@ -391,6 +405,9 @@ def main():
                     intraday_atr14 = latest(intra.get("atr14", []))
                     intraday_atr3  = latest(intra.get("atr3", []))
                     asset_intraday_atr[asset] = intraday_atr14
+                    
+                    atr14_1h = latest(tf_1h.get("atr14", []))
+                    asset_1h_atr[asset] = atr14_1h
 
                     market_sections.append({
                         "asset":         asset,
@@ -436,7 +453,7 @@ def main():
             # driven purely by deterministic logic, not model latency.
             try:
                 await asyncio.to_thread(
-                    pos_mgr.manage, state["positions"], asset_intraday_atr
+                    pos_mgr.manage, state["positions"], asset_1h_atr
                 )
             except Exception as pm_err:
                 add_event(f"PositionManager error: {pm_err}")
@@ -589,9 +606,26 @@ def main():
                                 }) + "\n")
                             continue
 
+                        # --- ADX Regime Filter ---
+                        adx_val = latest(asset_intraday_data.get(asset, {}).get("adx", []))
+                        ok, adx_reason = risk_mgr.check_trend_strength({
+                            "adx": adx_val
+                        })
+                        if not ok:
+                            add_event(f"ADX REGIME BLOCK {asset}: {adx_reason}")
+                            with open(diary_path, "a") as f:
+                                f.write(json.dumps({
+                                    "timestamp":          datetime.now(timezone.utc).isoformat(),
+                                    "asset":              asset,
+                                    "action":             "adx_blocked",
+                                    "reason":             adx_reason,
+                                }) + "\n")
+                            continue
+
                         # --- Risk validation ---------------------------------
                         output["current_price"] = current_price
                         output["atr_at_entry"] = asset_intraday_atr.get(asset)
+                        output["atr_1h"] = asset_1h_atr.get(asset)
                         account_state_for_risk = {
                             "balance":     state["balance"],
                             "total_value": account_value,
@@ -623,9 +657,9 @@ def main():
                         if order_type == "limit" and limit_price:
                             limit_price = float(limit_price)
                             if is_buy:
-                                order_res = await _t(mt5_api.place_limit_buy, asset, alloc_usd, limit_price)
+                                order_res = await _t(mt5_api.place_limit_buy, asset, alloc_usd, limit_price, tp_price, sl_price)
                             else:
-                                order_res = await _t(mt5_api.place_limit_sell, asset, alloc_usd, limit_price)
+                                order_res = await _t(mt5_api.place_limit_sell, asset, alloc_usd, limit_price, tp_price, sl_price)
                             add_event(f"LIMIT {action.upper()} {asset} ${alloc_usd:.2f} @ {limit_price}")
                         else:
                             if is_buy:
@@ -636,6 +670,15 @@ def main():
                         retcode = order_res.get("retcode", -1)
                         ticket  = order_res.get("order", 0) or order_res.get("deal", 0)
                         success = retcode == 10009  # TRADE_RETCODE_DONE
+
+                        # If market order succeeds, forcefully re-attach the TP and SL 
+                        # just in case this broker enforces "Market Execution" (which strips initial TP/SL natively).
+                        if success and order_type != "limit" and (tp_price > 0 or sl_price > 0):
+                            await asyncio.sleep(0.5)  # Let MT5 register the trade first
+                            try:
+                                await _t(mt5_api.force_modify_sltp_on_market_order, asset, is_buy, tp_price, sl_price)
+                            except Exception as er:
+                                add_event(f"Fail attaching SL/TP to Market Exec {asset}: {er}")
 
                         if not success:
                             add_event(f"Order failed {asset}: retcode={retcode} comment={order_res.get('comment')}")
@@ -661,7 +704,7 @@ def main():
                                     initial_tp=(float(output["tp_price"])
                                                 if output.get("tp_price") else None),
                                     is_buy=is_buy,
-                                    atr_at_entry=asset_intraday_atr.get(asset),
+                                    atr_at_entry=asset_1h_atr.get(asset),
                                 )
                             except Exception as reg_err:
                                 add_event(f"PositionManager register error {asset}: {reg_err}")
@@ -730,6 +773,7 @@ def main():
                         allowed, reason, adj_tp, adj_sl = risk_mgr.validate_adjust(
                             asset, target_pos, new_tp, new_sl,
                             asset_intraday_atr.get(asset),
+                            asset_1h_atr.get(asset),
                         )
                         if not allowed:
                             add_event(f"RISK BLOCKED adjust {asset}: {reason}")

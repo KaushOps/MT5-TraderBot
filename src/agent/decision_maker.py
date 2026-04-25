@@ -36,10 +36,23 @@ class TradingAgent:
         self.current_model_idx = 0
         self.model_name = self.fallback_models[self.current_model_idx]
         
+        self.openrouter_models = [
+            "meta-llama/llama-3.3-70b-instruct",
+            "anthropic/claude-3.5-sonnet",
+            "openai/gpt-4o"
+        ]
+
         self.client     = OpenAI(
             api_key=CONFIG["llm_api_key"],
             base_url=CONFIG.get("llm_base_url") or "https://api.groq.com/openai/v1"
         )
+        self.fallback_client = None
+        if CONFIG.get("fallback_llm_api_key"):
+            self.fallback_client = OpenAI(
+                api_key=CONFIG["fallback_llm_api_key"],
+                base_url=CONFIG.get("fallback_llm_base_url") or "https://openrouter.ai/api/v1"
+            )
+        self.active_client = self.client
         self.enable_tools = CONFIG.get("enable_tool_calling", True)
 
     def decide_trade(self, assets, context):
@@ -258,7 +271,7 @@ class TradingAgent:
                     )},
                     {"role": "user", "content": raw_content}
                 ]
-                resp = self.client.chat.completions.create(
+                resp = self.active_client.chat.completions.create(
                     model=self.model_name,
                     messages=sanitize_msgs,
                     temperature=0.0
@@ -346,7 +359,7 @@ class TradingAgent:
                     req_kwargs["tools"] = tools
                     req_kwargs["tool_choice"] = "auto"
                 
-                response = self.client.chat.completions.create(**req_kwargs)
+                response = self.active_client.chat.completions.create(**req_kwargs)
                 
                 msg = response.choices[0].message
 
@@ -427,16 +440,27 @@ class TradingAgent:
                 err_str = str(api_err).lower()
                 is_rate_limit = "429" in err_str or "rate limit" in err_str or "rate_limit" in err_str or "413" in err_str
                 is_decommissioned = "model_decommissioned" in err_str or "decommissioned" in err_str
+                is_conn_error = "connection" in err_str or "timeout" in err_str or "502" in err_str or "503" in err_str
                 
-                if is_rate_limit or is_decommissioned:
-                    reason = "Rate limit" if is_rate_limit else "Decommissioned model"
+                if is_rate_limit or is_decommissioned or is_conn_error:
+                    reason = "Rate limit" if is_rate_limit else ("Decommissioned model" if is_decommissioned else "Connection Error")
                     logger.warning("%s hit for model %s: %s", reason, self.model_name, api_err)
                     
                     # Try next model
                     self.current_model_idx += 1
                     if self.current_model_idx >= len(self.fallback_models):
-                        logger.error("All fallback models exhausted. Cannot proceed.")
+                        if self.fallback_client and self.active_client == self.client:
+                            logger.warning("Primary API exhausted. Failing over to OpenRouter Fallback API.")
+                            self.active_client = self.fallback_client
+                            self.fallback_models = self.openrouter_models
+                            self.current_model_idx = 0
+                            self.model_name = self.fallback_models[self.current_model_idx]
+                            with open("llm_requests.log", "a", encoding="utf-8") as f:
+                                f.write("Switched to FALLBACK API Provider (OpenRouter) with Premium Models.\n")
+                            continue
+                        logger.error("All models and fallback providers exhausted. Cannot proceed.")
                         self.current_model_idx = 0  # Reset for future runs
+                        self.active_client = self.client # reset active to main on loop restart
                         break
                     
                     self.model_name = self.fallback_models[self.current_model_idx]

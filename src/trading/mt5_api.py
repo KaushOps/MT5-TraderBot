@@ -57,6 +57,8 @@ class MT5API:
         self._connected = False
         self._symbol_map: dict[str, str] = {}   # canonical → actual MT5 name
         self._symbol_info_cache: dict[str, object] = {}
+        self._typical_spreads: dict[str, float] = {}
+        self._account_currency = "USD"
 
         # Config
         self._login    = CONFIG["mt5_login"]
@@ -77,6 +79,7 @@ class MT5API:
                 info = mt5.account_info()
                 if info and info.login == self._login:
                     self._connected = True
+                    self._account_currency = info.currency
                     logger.info(
                         "Connected to MT5 | Account: %s | Server: %s | "
                         "Balance: %.2f %s | Leverage: 1:%s",
@@ -93,6 +96,7 @@ class MT5API:
             ):
                 self._connected = True
                 info = mt5.account_info()
+                self._account_currency = info.currency if info else "USD"
                 logger.info(
                     "Connected to MT5 | Account: %s | Server: %s | "
                     "Balance: %.2f %s | Leverage: 1:%s",
@@ -254,6 +258,46 @@ class MT5API:
         if actual is None:
             return 0.0
         return self._mid_price(actual)
+
+    def get_account_currency(self) -> str:
+        return self._account_currency
+
+    def get_conversion_rate(self, base: str, quote: str) -> float:
+        """Get exchange rate from base to quote (e.g. USD to INR)."""
+        if base == quote:
+            return 1.0
+        self._ensure_connected()
+        symbol = self.resolve_symbol(f"{base}{quote}")
+        if symbol:
+            cur = self._mid_price(symbol)
+            if cur > 0: return cur
+        symbol_inv = self.resolve_symbol(f"{quote}{base}")
+        if symbol_inv:
+            cur = self._mid_price(symbol_inv)
+            if cur > 0: return 1.0 / cur
+        return 1.0
+
+    def get_effective_spread(self, symbol: str) -> tuple[float, float, float]:
+        """Return (capped_spread_dist, live_spread, typical_spread) in price distance terms."""
+        self._ensure_connected()
+        actual = self.resolve_symbol(symbol)
+        if actual is None:
+            return 0.0, 0.0, 0.0
+        tick = mt5.symbol_info_tick(actual)
+        if not tick:
+            return 0.0, 0.0, 0.0
+            
+        live_spread = abs(tick.ask - tick.bid)
+        
+        # EMA of spread
+        if actual not in self._typical_spreads:
+            self._typical_spreads[actual] = live_spread
+        else:
+            self._typical_spreads[actual] = 0.9 * self._typical_spreads[actual] + 0.1 * live_spread
+            
+        typical = self._typical_spreads[actual]
+        capped = min(live_spread, typical * 3.0)
+        return capped, live_spread, typical
 
     def get_candles(self, symbol: str, interval: str = "5m", count: int = 100) -> list[dict]:
         """Fetch OHLCV bars from MT5 and return them as a list of dicts.
@@ -504,7 +548,7 @@ class MT5API:
         logger.info("SELL %s lots=%.5f price=%.5f sl=%.5f tp=%.5f", actual, lots, price, sl_price, tp_price)
         return self._send_order(request)
 
-    def place_limit_buy(self, symbol: str, allocation_usd: float, limit_price: float) -> dict:
+    def place_limit_buy(self, symbol: str, allocation_usd: float, limit_price: float, tp_price: float = 0.0, sl_price: float = 0.0) -> dict:
         """Place a pending BUY_LIMIT order at ``limit_price``."""
         self._ensure_connected()
         actual = self.resolve_symbol(symbol)
@@ -520,16 +564,18 @@ class MT5API:
             "volume":    lots,
             "type":      mt5.ORDER_TYPE_BUY_LIMIT,
             "price":     limit_price,
+            "sl":        sl_price,
+            "tp":        tp_price,
             "deviation": self._slippage,
             "magic":     self._magic,
             "comment":   "V2_BUY_LIMIT",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": self._filling_mode(symbol),
         }
-        logger.info("BUY_LIMIT %s lots=%.5f @ %.5f", actual, lots, limit_price)
+        logger.info("BUY_LIMIT %s lots=%.5f @ %.5f sl=%.5f tp=%.5f", actual, lots, limit_price, sl_price, tp_price)
         return self._send_order(request)
 
-    def place_limit_sell(self, symbol: str, allocation_usd: float, limit_price: float) -> dict:
+    def place_limit_sell(self, symbol: str, allocation_usd: float, limit_price: float, tp_price: float = 0.0, sl_price: float = 0.0) -> dict:
         """Place a pending SELL_LIMIT order at ``limit_price``."""
         self._ensure_connected()
         actual = self.resolve_symbol(symbol)
@@ -545,13 +591,15 @@ class MT5API:
             "volume":    lots,
             "type":      mt5.ORDER_TYPE_SELL_LIMIT,
             "price":     limit_price,
+            "sl":        sl_price,
+            "tp":        tp_price,
             "deviation": self._slippage,
             "magic":     self._magic,
             "comment":   "V2_SELL_LIMIT",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": self._filling_mode(symbol),
         }
-        logger.info("SELL_LIMIT %s lots=%.5f @ %.5f", actual, lots, limit_price)
+        logger.info("SELL_LIMIT %s lots=%.5f @ %.5f sl=%.5f tp=%.5f", actual, lots, limit_price, sl_price, tp_price)
         return self._send_order(request)
 
     def place_take_profit(self, symbol: str, is_buy: bool, _amount, tp_price: float) -> dict:
@@ -598,6 +646,10 @@ class MT5API:
         }
         logger.info("Modify SLTP %s ticket=%d sl=%.5f tp=%.5f", actual, pos.ticket, new_sl or 0, new_tp or 0)
         return self._send_order(request)
+
+    def force_modify_sltp_on_market_order(self, symbol: str, is_buy: bool, tp: float, sl: float) -> None:
+        """Helper to force attach SL and TP onto a market order after opening."""
+        self._modify_position_sltp(symbol, is_buy, tp, sl)
 
     def close_position(self, symbol: str, ticket: int, volume: float, is_buy: bool) -> dict:
         """Close (or partially close) an open position by ticket."""
