@@ -162,6 +162,7 @@ class RiskManager:
             return sl_price
         # Auto-set SL at mandatory_sl_pct from entry
         sl_distance = entry_price * (self.mandatory_sl_pct / 100.0)
+        # Note: rounding here is a fallback; usually handled in enforce_atr_bounds
         if is_buy:
             return round(entry_price - sl_distance, 5)
         else:
@@ -261,11 +262,18 @@ class RiskManager:
 
         # --- Convert distances back to prices on correct side of entry ---
         if is_buy:
-            final_sl = round(entry_price - sl_dist, 5)
-            final_tp = round(entry_price + tp_dist, 5)
+            final_sl = entry_price - sl_dist
+            final_tp = entry_price + tp_dist
         else:
-            final_sl = round(entry_price + sl_dist, 5)
-            final_tp = round(entry_price - tp_dist, 5)
+            final_sl = entry_price + sl_dist
+            final_tp = entry_price - tp_dist
+
+        if symbol and self.mt5_api:
+            final_sl = self.mt5_api._round_price(symbol, final_sl)
+            final_tp = self.mt5_api._round_price(symbol, final_tp)
+        else:
+            final_sl = round(final_sl, 5)
+            final_tp = round(final_tp, 5)
 
         return final_tp, final_sl, log, sl_dist
 
@@ -501,17 +509,33 @@ class RiskManager:
         min_dist = entry_price * 0.001
         if is_buy:
             if final_sl > 0 and (entry_price - final_sl) < min_dist:
-                final_sl = round(entry_price - min_dist, 5)
+                final_sl = entry_price - min_dist
+                if asset and self.mt5_api:
+                    final_sl = self.mt5_api._round_price(asset, final_sl)
+                else:
+                    final_sl = round(final_sl, 5)
                 logging.warning("RISK: BUY SL too close, adjusted to %.5f", final_sl)
             if final_tp and float(final_tp) > 0 and (float(final_tp) - entry_price) < min_dist:
-                final_tp = round(entry_price + min_dist, 5)
+                final_tp = entry_price + min_dist
+                if asset and self.mt5_api:
+                    final_tp = self.mt5_api._round_price(asset, final_tp)
+                else:
+                    final_tp = round(final_tp, 5)
                 logging.warning("RISK: BUY TP too close, adjusted to %.5f", final_tp)
         else:
             if final_sl > 0 and (final_sl - entry_price) < min_dist:
-                final_sl = round(entry_price + min_dist, 5)
+                final_sl = entry_price + min_dist
+                if asset and self.mt5_api:
+                    final_sl = self.mt5_api._round_price(asset, final_sl)
+                else:
+                    final_sl = round(final_sl, 5)
                 logging.warning("RISK: SELL SL too close, adjusted to %.5f", final_sl)
             if final_tp and float(final_tp) > 0 and (entry_price - float(final_tp)) < min_dist:
-                final_tp = round(entry_price - min_dist, 5)
+                final_tp = entry_price - min_dist
+                if asset and self.mt5_api:
+                    final_tp = self.mt5_api._round_price(asset, final_tp)
+                else:
+                    final_tp = round(final_tp, 5)
                 logging.warning("RISK: SELL TP too close, adjusted to %.5f", final_tp)
 
         trade = {**trade, "sl_price": final_sl, "tp_price": final_tp,

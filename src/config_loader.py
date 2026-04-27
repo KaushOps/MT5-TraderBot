@@ -57,6 +57,11 @@ CONFIG = {
 
     # ── LLM Configuration ────────────────────────────────────────────────────
     "llm_api_key":          _get_env("LLM_API_KEY", required=True),
+    "llm_api_key_2":        _get_env("LLM_API_KEY_2"),
+    "llm_api_key_3":        _get_env("LLM_API_KEY_3"),
+    "llm_api_key_4":        _get_env("LLM_API_KEY_4"),
+    "llm_api_key_5":        _get_env("LLM_API_KEY_5"),
+    "llm_api_key_6":        _get_env("LLM_API_KEY_6"),
     "llm_model":            _get_env("LLM_MODEL", "llama-3.3-70b-versatile"),
     "llm_base_url":         _get_env("LLM_BASE_URL", "https://api.groq.com/openai/v1"),
     "fallback_llm_api_key":   _get_env("FALLBACK_LLM_API_KEY"),

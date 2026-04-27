@@ -24,7 +24,6 @@ class TradingAgent:
         all_models = [
             base_model, 
             "llama-3.3-70b-versatile", 
-            "llama3-70b-8192",
         ]
         self.fallback_models = []
         for m in all_models:
@@ -35,14 +34,27 @@ class TradingAgent:
         
         self.openrouter_models = [
             "meta-llama/llama-3.3-70b-instruct",
-            "anthropic/claude-3.5-sonnet",
-            "openai/gpt-4o"
+            "anthropic/claude-3.5-sonnet-20241022",
+            "google/gemini-2.0-flash-001"
         ]
 
-        self.client     = OpenAI(
-            api_key=CONFIG["llm_api_key"],
-            base_url=CONFIG.get("llm_base_url") or "https://api.groq.com/openai/v1"
-        )
+        # --- Multi-Groq-key rotation -----------------------------------------
+        # Build a list of Groq clients from all available API keys.
+        # When one key hits the daily rate limit, we rotate to the next account
+        # before falling back to OpenRouter.
+        groq_base = CONFIG.get("llm_base_url") or "https://api.groq.com/openai/v1"
+        groq_keys = [CONFIG["llm_api_key"]]
+        for extra in ("llm_api_key_2", "llm_api_key_3", "llm_api_key_4", "llm_api_key_5", "llm_api_key_6"):
+            k = CONFIG.get(extra)
+            if k:
+                groq_keys.append(k)
+        self.groq_clients = [
+            OpenAI(api_key=k, base_url=groq_base) for k in groq_keys
+        ]
+        self.groq_client_idx = 0
+        self.client = self.groq_clients[0]
+        logger.info("Groq key pool: %d account(s) loaded", len(self.groq_clients))
+
         self.fallback_client = None
         if CONFIG.get("fallback_llm_api_key"):
             self.fallback_client = OpenAI(
@@ -50,6 +62,9 @@ class TradingAgent:
                 base_url=CONFIG.get("fallback_llm_base_url") or "https://openrouter.ai/api/v1"
             )
         self.active_client = self.client
+        # Store initial state for reset at each cycle
+        self._initial_models = list(self.fallback_models)
+        self._initial_model_idx = 0
         self.enable_tools = CONFIG.get("enable_tool_calling", True)
 
     def decide_trade(self, assets, context):
@@ -60,6 +75,12 @@ class TradingAgent:
 
     def _decide(self, context: str, assets):
         """Send context to the LLM and return structured trade decisions."""
+        # Reset model state at the start of each decision cycle so a broken
+        # model from a previous cycle (e.g. 404 on a stale name) doesn't persist.
+        self.active_client = self.client
+        self.fallback_models = list(self._initial_models)
+        self.current_model_idx = self._initial_model_idx
+        self.model_name = self.fallback_models[self.current_model_idx]
 
         system_prompt = (
             "You are a rigorous QUANTITATIVE TRADER and interdisciplinary MATHEMATICIAN-ENGINEER "
@@ -290,6 +311,11 @@ class TradingAgent:
                     return result
                 return {"reasoning": "", "trade_decisions": []}
             except Exception as se:
+                err_str = str(se).lower()
+                is_api_err = "429" in err_str or "rate limit" in err_str or "404" in err_str or "connection" in err_str or "502" in err_str or "503" in err_str
+                if is_api_err:
+                    logger.warning("Sanitize API call failed with %s, raising to trigger failover", se)
+                    raise se
                 logger.error("Sanitize failed: %s", se)
                 return {"reasoning": "", "trade_decisions": []}
 
@@ -427,6 +453,13 @@ class TradingAgent:
                 logger.warning("Sanitize failed on model %s, trying fallback model", self.model_name)
                 self.current_model_idx += 1
                 if self.current_model_idx >= len(self.fallback_models):
+                    if self.fallback_client and self.active_client in self.groq_clients:
+                        logger.warning("Primary API models exhausted for JSON formatting. Failing over to OpenRouter.")
+                        self.active_client = self.fallback_client
+                        self.fallback_models = self.openrouter_models
+                        self.current_model_idx = 0
+                        self.model_name = self.fallback_models[self.current_model_idx]
+                        continue
                     logger.error("All fallback models exhausted after JSON failures.")
                     self.current_model_idx = 0
                     break
@@ -438,23 +471,37 @@ class TradingAgent:
                 err_str = str(api_err).lower()
                 is_rate_limit = "429" in err_str or "rate limit" in err_str or "rate_limit" in err_str or "413" in err_str
                 is_decommissioned = "model_decommissioned" in err_str or "decommissioned" in err_str
+                is_not_found = "404" in err_str or "not found" in err_str or "no endpoints" in err_str
                 is_conn_error = "connection" in err_str or "timeout" in err_str or "502" in err_str or "503" in err_str
                 
-                if is_rate_limit or is_decommissioned or is_conn_error:
-                    reason = "Rate limit" if is_rate_limit else ("Decommissioned model" if is_decommissioned else "Connection Error")
+                if is_rate_limit or is_decommissioned or is_not_found or is_conn_error:
+                    reason = "Rate limit" if is_rate_limit else ("Decommissioned model" if is_decommissioned else ("Model not found" if is_not_found else "Connection Error"))
                     logger.warning("%s hit for model %s: %s", reason, self.model_name, api_err)
+                    
+                    # If it's a rate limit on Groq, try rotating API keys first before switching models
+                    if is_rate_limit and hasattr(self, "groq_clients") and self.active_client in self.groq_clients:
+                        current_idx = self.groq_clients.index(self.active_client)
+                        if current_idx + 1 < len(self.groq_clients):
+                            self.active_client = self.groq_clients[current_idx + 1]
+                            self.client = self.active_client  # Update primary client so it persists across cycles
+                            logger.info("Rotated to next Groq API key (index %d). Retrying model %s.", current_idx + 1, self.model_name)
+                            with open("llm_requests.log", "a", encoding="utf-8") as f:
+                                f.write(f"Rate limited. Rotated API key to index {current_idx + 1}\\n")
+                            continue # Retry same model with new key
+                        else:
+                            logger.warning("Exhausted all Groq API keys.")
                     
                     # Try next model
                     self.current_model_idx += 1
                     if self.current_model_idx >= len(self.fallback_models):
-                        if self.fallback_client and self.active_client == self.client:
+                        if self.fallback_client and self.active_client in self.groq_clients:
                             logger.warning("Primary API exhausted. Failing over to OpenRouter Fallback API.")
                             self.active_client = self.fallback_client
                             self.fallback_models = self.openrouter_models
                             self.current_model_idx = 0
                             self.model_name = self.fallback_models[self.current_model_idx]
                             with open("llm_requests.log", "a", encoding="utf-8") as f:
-                                f.write("Switched to FALLBACK API Provider (OpenRouter) with Premium Models.\n")
+                                f.write("Switched to FALLBACK API Provider (OpenRouter) with Premium Models.\\n")
                             continue
                         logger.error("All models and fallback providers exhausted. Cannot proceed.")
                         self.current_model_idx = 0  # Reset for future runs
@@ -465,7 +512,7 @@ class TradingAgent:
                     logger.info("Gracefully falling back to model: %s", self.model_name)
                     
                     with open("llm_requests.log", "a", encoding="utf-8") as f:
-                        f.write(f"Rate limited. Switched to model: {self.model_name}\n")
+                        f.write(f"Switched to model: {self.model_name}\\n")
                     
                     continue # Retry on this new model
                 

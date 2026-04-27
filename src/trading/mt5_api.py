@@ -160,6 +160,22 @@ class MT5API:
             self._symbol_info_cache[actual] = mt5.symbol_info(actual)
         return self._symbol_info_cache[actual]
 
+    def _round_price(self, symbol: str, price: float) -> float:
+        """Round price to the symbol's tick_size and digits."""
+        if price is None or price <= 0:
+            return 0.0
+        info = self._symbol_info(symbol)
+        if info is None:
+            return round(price, 5)
+
+        trade_tick_size = info.trade_tick_size
+        digits = info.digits
+        
+        # Align to tick size grid
+        # We use a small epsilon to avoid rounding down due to float imprecision (e.g. 0.999999999)
+        rounded = round(price / trade_tick_size) * trade_tick_size
+        return round(rounded, digits)
+
     # ------------------------------------------------------------------
     # Lot size calculation
     # ------------------------------------------------------------------
@@ -486,10 +502,14 @@ class MT5API:
         tick = mt5.symbol_info_tick(actual)
         if tick is None:
             return {"retcode": -1, "comment": f"No tick for {actual}"}
-        price = tick.ask
+        price = self._round_price(symbol, tick.ask)
         lots = self.calc_lots(symbol, allocation_usd, price)
         if lots <= 0:
             return {"retcode": -1, "comment": f"Invalid lot size for ${allocation_usd}"}
+            
+        sl_price = self._round_price(symbol, sl_price)
+        tp_price = self._round_price(symbol, tp_price)
+        
         request = {
             "action":    mt5.TRADE_ACTION_DEAL,
             "symbol":    actual,
@@ -527,10 +547,14 @@ class MT5API:
         tick = mt5.symbol_info_tick(actual)
         if tick is None:
             return {"retcode": -1, "comment": f"No tick for {actual}"}
-        price = tick.bid
+        price = self._round_price(symbol, tick.bid)
         lots = self.calc_lots(symbol, allocation_usd, price)
         if lots <= 0:
             return {"retcode": -1, "comment": f"Invalid lot size for ${allocation_usd}"}
+            
+        sl_price = self._round_price(symbol, sl_price)
+        tp_price = self._round_price(symbol, tp_price)
+        
         request = {
             "action":    mt5.TRADE_ACTION_DEAL,
             "symbol":    actual,
@@ -558,6 +582,11 @@ class MT5API:
         lots = self.calc_lots(symbol, allocation_usd, limit_price or price)
         if lots <= 0:
             return {"retcode": -1, "comment": "Invalid lot size"}
+            
+        limit_price = self._round_price(symbol, limit_price)
+        sl_price    = self._round_price(symbol, sl_price)
+        tp_price    = self._round_price(symbol, tp_price)
+        
         request = {
             "action":    mt5.TRADE_ACTION_PENDING,
             "symbol":    actual,
@@ -585,6 +614,11 @@ class MT5API:
         lots = self.calc_lots(symbol, allocation_usd, limit_price or price)
         if lots <= 0:
             return {"retcode": -1, "comment": "Invalid lot size"}
+            
+        limit_price = self._round_price(symbol, limit_price)
+        sl_price    = self._round_price(symbol, sl_price)
+        tp_price    = self._round_price(symbol, tp_price)
+        
         request = {
             "action":    mt5.TRADE_ACTION_PENDING,
             "symbol":    actual,
@@ -634,15 +668,15 @@ class MT5API:
             bot_pos = list(positions)
         pos = sorted(bot_pos, key=lambda p: p.time, reverse=True)[0]
 
-        new_tp = tp if tp is not None else pos.tp
-        new_sl = sl if sl is not None else pos.sl
-
+        new_tp = self._round_price(symbol, tp) if tp is not None else pos.tp
+        new_sl = self._round_price(symbol, sl) if sl is not None else pos.sl
+        
         request = {
             "action":   mt5.TRADE_ACTION_SLTP,
             "symbol":   actual,
             "position": pos.ticket,
-            "sl":       new_sl or 0.0,
-            "tp":       new_tp or 0.0,
+            "sl":       new_sl,
+            "tp":       new_tp,
         }
         logger.info("Modify SLTP %s ticket=%d sl=%.5f tp=%.5f", actual, pos.ticket, new_sl or 0, new_tp or 0)
         return self._send_order(request)
@@ -661,7 +695,7 @@ class MT5API:
         if tick is None:
             return {"retcode": -1, "comment": "No tick"}
         close_type = mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY
-        price = tick.bid if is_buy else tick.ask
+        price = self._round_price(symbol, tick.bid if is_buy else tick.ask)
         request = {
             "action":    mt5.TRADE_ACTION_DEAL,
             "symbol":    actual,
