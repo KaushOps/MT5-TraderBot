@@ -189,7 +189,8 @@ class RiskManager:
         The adjustments_log dict carries human-readable reasons for logging.
         """
         log: dict = {}
-        atr = atr_1h if (atr_1h is not None and atr_1h > 0) else atr_5m
+        # Prioritize 5-minute ATR for tight, achievable intraday targets
+        atr = atr_5m if (atr_5m is not None and atr_5m > 0) else atr_1h
 
         if atr is None or atr <= 0 or entry_price <= 0:
             # Fallback: no ATR → use legacy mandatory_sl_pct based SL
@@ -344,7 +345,23 @@ class RiskManager:
             if entry_px == 0 or size == 0:
                 continue
 
-            notional = abs(size) * entry_px * contract_size
+            # Notional in quote currency (e.g. USD for XAUUSD)
+            notional_quote = abs(size) * entry_px * contract_size
+
+            # CRITICAL: Convert notional to account currency so it matches
+            # the units of `profit` (which MT5 returns in account currency).
+            # Without this, an INR account divides INR profit by USD notional,
+            # inflating the loss percentage by ~84× and causing premature
+            # force-closes.
+            conv_rate = 1.0
+            if self.mt5_api:
+                info = self.mt5_api._symbol_info(symbol)
+                if info:
+                    quote_curr = info.currency_profit
+                    acc_curr = self.mt5_api.get_account_currency()
+                    conv_rate = self.mt5_api.get_conversion_rate(quote_curr, acc_curr)
+
+            notional = notional_quote * conv_rate
             if notional == 0:
                 continue
 
@@ -352,8 +369,11 @@ class RiskManager:
 
             if loss_pct >= self.max_loss_per_position_pct:
                 logging.warning(
-                    "RISK: Force-closing %s — loss %.2f%% exceeds max %.2f%%",
-                    symbol, loss_pct, self.max_loss_per_position_pct
+                    "RISK: Force-closing %s — loss %.2f%% exceeds max %.2f%% "
+                    "(profit=%.2f %s, notional=%.2f %s)",
+                    symbol, loss_pct, self.max_loss_per_position_pct,
+                    profit, acc_curr if self.mt5_api else "?",
+                    notional, acc_curr if self.mt5_api else "?",
                 )
                 to_close.append({
                     "symbol": symbol,
